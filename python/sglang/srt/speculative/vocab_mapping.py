@@ -14,6 +14,7 @@ model vocabularies and provides:
 """
 
 import logging
+from typing import Optional
 
 import torch
 
@@ -21,12 +22,38 @@ logger = logging.getLogger(__name__)
 
 # Tokenizer-specific space-prefix characters used by BPE tokenizers.
 # BPE vocabularies often encode a leading space as one of these Unicode chars.
-_SPACE_PREFIXES = ("\u0120", "\u2581")
+# Used as a static fallback; runtime detection is preferred (see _detect_space_sign).
+_KNOWN_SPACE_PREFIXES = ("\u0120", "\u2581")
 
 
-def _normalize_token(token: str) -> str:
-    """Normalize a BPE token by converting space-prefix characters to a plain space."""
-    for prefix in _SPACE_PREFIXES:
+def _detect_space_sign(tokenizer) -> Optional[str]:
+    """Detect the space-prefix character used by a tokenizer by encoding a literal space.
+
+    Returns the first character of the first token produced for " ", or None if the
+    tokenizer does not encode a leading space as a prefix character.
+    """
+    try:
+        space_ids = tokenizer(" ", add_special_tokens=False)["input_ids"]
+        if space_ids:
+            tok_str = tokenizer.convert_ids_to_tokens(space_ids)[0]
+            if tok_str and tok_str[0] in _KNOWN_SPACE_PREFIXES:
+                return tok_str[0]
+    except Exception:
+        pass
+    return None
+
+
+def _normalize_token(token: str, space_sign: Optional[str] = None) -> str:
+    """Normalize a BPE token by converting its space-prefix character to a plain space.
+
+    If ``space_sign`` is provided it is used directly; otherwise all known prefixes
+    are tried (static fallback for tokenizers that weren't probed at startup).
+    """
+    if space_sign is not None:
+        if token.startswith(space_sign):
+            return " " + token[len(space_sign) :]
+        return token
+    for prefix in _KNOWN_SPACE_PREFIXES:
         if token.startswith(prefix):
             return " " + token[len(prefix) :]
     return token
@@ -59,26 +86,46 @@ class VocabMapping:
         self.draft_vocab_size = draft_vocab_size
         self.device = device
 
-        # Validate that both tokenizers have an unk_token_id.
-        # Silently falling back to token 0 would corrupt the draft KV cache
-        # for out-of-intersection tokens on models where token 0 is a special
-        # token (e.g. BOS on Llama).
-        self.target_unk_token_id: int = target_tokenizer.unk_token_id
-        if self.target_unk_token_id is None:
+        # Resolve unk_token_id for out-of-intersection fallback.
+        # Llama 3, SmolLM2, and other models may not define unk_token_id;
+        # we fall back to eos_token_id (always present) so that such models
+        # are still supported. Using EOS as the fallback is safe: the
+        # out-of-intersection token will be fed back into the draft KV cache
+        # but will always be rejected by the target's acceptance criterion,
+        # preserving losslessness.
+        self.target_unk_token_id: int = (
+            target_tokenizer.unk_token_id
+            if target_tokenizer.unk_token_id is not None
+            else target_tokenizer.eos_token_id
+        )
+        self.draft_unk_token_id: int = (
+            draft_tokenizer.unk_token_id
+            if draft_tokenizer.unk_token_id is not None
+            else draft_tokenizer.eos_token_id
+        )
+        if self.target_unk_token_id is None or self.draft_unk_token_id is None:
             raise ValueError(
-                "Target tokenizer does not have an unk_token_id. "
-                "TLI (universal_draft) requires tokenizers with a defined unk_token. "
-                "Compatible models include Qwen (all generations), Llama 1/2, Mistral, "
-                "and Gemma. Llama 3 and SmolLM2 are not supported."
+                "Target or draft tokenizer has neither unk_token_id nor eos_token_id. "
+                "Cannot determine a safe fallback token for out-of-intersection IDs."
             )
-        self.draft_unk_token_id: int = draft_tokenizer.unk_token_id
-        if self.draft_unk_token_id is None:
-            raise ValueError(
-                "Draft tokenizer does not have an unk_token_id. "
-                "TLI (universal_draft) requires tokenizers with a defined unk_token. "
-                "Compatible models include Qwen (all generations), Llama 1/2, Mistral, "
-                "and Gemma. Llama 3 and SmolLM2 are not supported."
+        if target_tokenizer.unk_token_id is None:
+            logger.warning(
+                "Target tokenizer has no unk_token_id; using eos_token_id=%d as fallback "
+                "for out-of-intersection tokens (e.g. Llama 3, SmolLM2).",
+                self.target_unk_token_id,
             )
+        if draft_tokenizer.unk_token_id is None:
+            logger.warning(
+                "Draft tokenizer has no unk_token_id; using eos_token_id=%d as fallback "
+                "for out-of-intersection tokens.",
+                self.draft_unk_token_id,
+            )
+
+        # Detect space-prefix characters dynamically so that unusual tokenizers
+        # (e.g. those that use a different prefix not in _KNOWN_SPACE_PREFIXES)
+        # are still matched correctly.
+        target_space_sign = _detect_space_sign(target_tokenizer)
+        draft_space_sign = _detect_space_sign(draft_tokenizer)
 
         # Build normalized vocabularies.  When two tokens normalize to the
         # same string we keep only the first occurrence (lowest token ID).
@@ -87,13 +134,13 @@ class VocabMapping:
 
         target_normalized: dict[str, int] = {}
         for token, tid in target_vocab.items():
-            norm = _normalize_token(token)
+            norm = _normalize_token(token, target_space_sign)
             if norm not in target_normalized:
                 target_normalized[norm] = tid
 
         draft_normalized: dict[str, int] = {}
         for token, tid in draft_vocab.items():
-            norm = _normalize_token(token)
+            norm = _normalize_token(token, draft_space_sign)
             if norm not in draft_normalized:
                 draft_normalized[norm] = tid
 
@@ -118,6 +165,11 @@ class VocabMapping:
         # Boolean mask over the draft vocabulary: True iff the token is in the intersection.
         self.intersection_mask_draft = intersection_mask_draft.to(device)
         self.intersection_size = int(intersection_mask_draft.sum().item())
+        # Sorted draft token IDs in the intersection: shape [intersection_size].
+        # Used for LM head pruning (see TLIWorker._try_prune_draft_lm_head).
+        self.intersection_draft_ids = intersection_mask_draft.nonzero(as_tuple=True)[
+            0
+        ].to(device)
 
         logger.info(
             "VocabMapping initialized: target_vocab=%d, draft_vocab=%d, "
