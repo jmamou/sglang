@@ -27,7 +27,12 @@ import logging
 from typing import List, Optional
 
 import torch
+import torch.nn as nn
 
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
@@ -44,6 +49,78 @@ from sglang.srt.speculative.vocab_mapping import VocabMapping
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 logger = logging.getLogger(__name__)
+
+
+class _PrunedReindexLMHead(nn.Module):
+    """Pruned draft LM head restricted to vocabulary-intersection tokens.
+
+    Replaces the full ``[vocab_size, hidden_dim]`` weight matrix with a compact
+    ``[intersection_size, hidden_dim]`` one.  The forward pass:
+      1. Computes ``compact = hidden @ pruned_weight.T``  — ``O(B × K × H)`` instead
+         of ``O(B × V × H)``.
+      2. Scatters the K results back into a ``[B, V]`` tensor pre-filled with
+         ``-inf``, so the output shape is identical to the original lm_head and
+         no change is needed downstream.
+
+    The ``-inf`` fill means that ``constrain_draft_logits`` in
+    :class:`TLIWorker` becomes a no-op (already a no-op by construction).
+
+    ``set_lora`` / ``apply_lora`` stubs are provided so that
+    :func:`~sglang.srt.layers.logits_processor.LogitsProcessor._compute_lm_head`
+    routes through ``lm_head(hidden_states)`` rather than performing the matmul
+    itself (which would bypass the scatter step).
+    """
+
+    def __init__(
+        self,
+        pruned_weight: torch.Tensor,
+        pruned_bias: Optional[torch.Tensor],
+        intersection_ids: torch.Tensor,
+        full_vocab_size: int,
+        use_fp32: bool = False,
+    ):
+        super().__init__()
+        # registered as buffers (not parameters) to avoid unintended training
+        self.register_buffer("weight", pruned_weight)
+        if pruned_bias is not None:
+            self.register_buffer("bias", pruned_bias)
+        else:
+            self.bias = None
+        self.register_buffer("intersection_ids", intersection_ids)
+        self.full_vocab_size = full_vocab_size
+        self.use_fp32 = use_fp32
+
+    # ── Stubs so _compute_lm_head routes through self(hidden_states) ──────────
+    def set_lora(self, *args, **kwargs):
+        pass
+
+    def apply_lora(self, *args, **kwargs):
+        pass
+
+    # ── Core forward ─────────────────────────────────────────────────────────
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_fp32:
+            compact = torch.matmul(x.to(torch.float32), self.weight.to(torch.float32).T)
+        else:
+            compact = torch.matmul(x.to(self.weight.dtype), self.weight.T)
+        if self.bias is not None:
+            compact = compact + self.bias
+        # scatter into full-vocab output; non-intersection positions stay at -inf
+        out = torch.full(
+            (x.shape[0], self.full_vocab_size),
+            float("-inf"),
+            dtype=compact.dtype,
+            device=x.device,
+        )
+        out[:, self.intersection_ids] = compact
+        return out
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.weight.shape[1]}, "
+            f"out_features={self.full_vocab_size}, "
+            f"pruned_size={self.weight.shape[0]}"
+        )
 
 
 class TLIWorker(StandaloneWorker):
@@ -66,6 +143,12 @@ class TLIWorker(StandaloneWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        # Defer CUDA graph capture so we can prune the draft LM head first.
+        # init_cuda_graphs() (overridden below) checks this flag and returns
+        # immediately; we call super().init_cuda_graphs() explicitly below after
+        # VocabMapping is built and the pruned lm_head is in place.
+        self._defer_cuda_graphs = True
+
         # StandaloneWorker.__init__ loads the draft model without sharing
         # embed / lm_head with the target model — exactly what we need.
         super().__init__(
@@ -114,9 +197,103 @@ class TLIWorker(StandaloneWorker):
             device=self.device,
         )
 
+        # ── Prune the draft LM head to the intersection (gap 3 vs HF) ────────
+        self._try_prune_draft_lm_head(server_args)
+
+        # ── Now capture CUDA graphs with the pruned LM head ──────────────────
+        self._defer_cuda_graphs = False
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            super().init_cuda_graphs()
+
     # ── Property alias ────────────────────────────────────────────────────────
     # StandaloneWorker inherits from EAGLEWorker which uses `draft_model_runner`
     # as a property pointing to `self.model_runner`.
+
+    def init_cuda_graphs(self):
+        """Defer CUDA graph capture until after LM head pruning.
+
+        Called by ``StandaloneWorker.__init__`` (via the context-managed block).
+        We skip it there and re-invoke explicitly once VocabMapping is built and
+        the draft LM head has been pruned.
+        """
+        if getattr(self, "_defer_cuda_graphs", False):
+            return  # will be called manually after LM head pruning
+        super().init_cuda_graphs()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # LM head pruning
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _try_prune_draft_lm_head(self, server_args) -> None:
+        """Replace the draft LM head with a pruned version restricted to intersection tokens.
+
+        This mirrors HuggingFace Transformers' ``_PruneReindexingLMHead``:
+        the effective matmul shrinks from ``hidden_dim × draft_vocab_size`` to
+        ``hidden_dim × intersection_size``, which is the dominant cost in draft
+        decoding when the intersection is much smaller than the full vocabulary.
+
+        The pruned head output has shape ``[batch, draft_vocab_size]`` with
+        non-intersection positions pre-filled with ``-inf``, so all downstream
+        code (including ``constrain_draft_logits`` and the logits buffer copy)
+        remains unchanged.
+
+        The CUDA graphs were already captured by ``StandaloneWorker.__init__``
+        (called by ``super().__init__()``).  The pruning replaces a Python
+        module attribute on the model *after* graph capture; the captured graph
+        is replayed through the same weight buffers — the pruned module's
+        ``forward`` is NOT inside the CUDA graph.  Instead, the CUDA graph
+        captures up to the point where logits are written into the pre-allocated
+        ``next_token_logits_buffer``; the pruned head's scatter-back step is
+        part of the captured graph because it is part of the model's ``forward``
+        call during graph capture.
+        """
+        try:
+            lm_head = self.draft_model_runner.model.lm_head
+        except AttributeError:
+            logger.warning(
+                "Draft model has no '.lm_head' attribute; skipping LM head pruning. "
+                "Set self.draft_model_runner.model.lm_head before calling TLIWorker.__init__ "
+                "if you want pruning for this architecture."
+            )
+            return
+
+        if not hasattr(lm_head, "weight"):
+            logger.warning(
+                "Draft LM head has no '.weight' attribute (quantized or unusual arch); "
+                "skipping LM head pruning."
+            )
+            return
+
+        intersection_ids = self.vocab_mapping.intersection_draft_ids  # [K]
+        K = intersection_ids.shape[0]
+        full_vocab_size = self.vocab_mapping.draft_vocab_size
+        use_fp32 = getattr(server_args, "enable_fp32_lm_head", False)
+
+        pruned_weight = lm_head.weight.data[intersection_ids].clone()
+        pruned_bias = (
+            lm_head.bias.data[intersection_ids].clone()
+            if getattr(lm_head, "bias", None) is not None
+            else None
+        )
+
+        pruned_head = _PrunedReindexLMHead(
+            pruned_weight=pruned_weight,
+            pruned_bias=pruned_bias,
+            intersection_ids=intersection_ids,
+            full_vocab_size=full_vocab_size,
+            use_fp32=use_fp32,
+        )
+        self.draft_model_runner.model.lm_head = pruned_head
+        logger.info(
+            "Draft LM head pruned to intersection: %d → %d tokens (%.1f%% of draft vocab). "
+            "Draft decode matmul reduced by %.1f×.",
+            full_vocab_size,
+            K,
+            100.0 * K / max(full_vocab_size, 1),
+            full_vocab_size / max(K, 1),
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Draft extend (prefill phase)
