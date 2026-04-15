@@ -43,8 +43,12 @@ if is_flashinfer_available():
             _maybe_get_cached_w3_w1_permute_indices,
             get_w2_permute_indices_with_cache,
         )
-    except ImportError:
-        pass
+    except ImportError as e:
+        logger.warning(
+            "Optional flashinfer MxInt4 MoE kernels could not be imported: %s. "
+            "CompressedTensorsMxInt4MoE will not be available.",
+            e,
+        )
 
 
 class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
