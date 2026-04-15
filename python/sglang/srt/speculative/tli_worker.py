@@ -239,15 +239,12 @@ class TLIWorker(StandaloneWorker):
         code (including ``constrain_draft_logits`` and the logits buffer copy)
         remains unchanged.
 
-        The CUDA graphs were already captured by ``StandaloneWorker.__init__``
-        (called by ``super().__init__()``).  The pruning replaces a Python
-        module attribute on the model *after* graph capture; the captured graph
-        is replayed through the same weight buffers — the pruned module's
-        ``forward`` is NOT inside the CUDA graph.  Instead, the CUDA graph
-        captures up to the point where logits are written into the pre-allocated
-        ``next_token_logits_buffer``; the pruned head's scatter-back step is
-        part of the captured graph because it is part of the model's ``forward``
-        call during graph capture.
+        CUDA graph capture is deliberately deferred until *after* this method
+        returns (see ``_defer_cuda_graphs`` in ``__init__``).  The captured
+        graph therefore encodes the smaller ``[intersection_size, hidden_dim]``
+        matmul rather than the full ``[draft_vocab_size, hidden_dim]`` one,
+        including the scatter-back step that fills non-intersection positions
+        with ``-inf``.
         """
         try:
             lm_head = self.draft_model_runner.model.lm_head
