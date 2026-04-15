@@ -19,6 +19,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE = auto()
     EAGLE3 = auto()
     STANDALONE = auto()
+    TLI = auto()
     NGRAM = auto()
     NONE = auto()
 
@@ -49,6 +50,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
+
+    def is_tli(self) -> bool:
+        return self == SpeculativeAlgorithm.TLI
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
@@ -109,6 +113,15 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
             return StandaloneWorker
+        elif self.is_tli():
+            if enable_overlap:
+                raise ValueError(
+                    "TLI speculative decoding does not support overlap scheduling yet. "
+                    "Disable overlap with --disable-overlap-schedule."
+                )
+            from sglang.srt.speculative.tli_worker import TLIWorker
+
+            return TLIWorker
         elif self.is_ngram():
             if enable_overlap:
                 raise ValueError(
