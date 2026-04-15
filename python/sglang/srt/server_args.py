@@ -3402,12 +3402,18 @@ class ServerArgs:
                 ) = auto_choose_speculative_params(self)
 
             if (
-                self.speculative_eagle_topk == 1
-                and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
+                self.speculative_eagle_topk is not None
+                and self.speculative_eagle_topk != 1
             ):
+                raise ValueError(
+                    "TLI speculative decoding only supports speculative_eagle_topk == 1."
+                )
+            self.speculative_eagle_topk = 1
+
+            if self.speculative_num_draft_tokens != self.speculative_num_steps + 1:
                 logger.warning(
                     "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 "
-                    "when speculative_eagle_topk == 1"
+                    "for TLI speculative decoding."
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
