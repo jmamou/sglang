@@ -1388,6 +1388,8 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
     ):
         bs = len(seq_lens)
+        if prefix_lens is None:
+            prefix_lens = torch.zeros_like(seq_lens)
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
