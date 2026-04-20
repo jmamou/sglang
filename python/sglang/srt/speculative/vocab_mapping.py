@@ -165,6 +165,14 @@ class VocabMapping:
         # Boolean mask over the draft vocabulary: True iff the token is in the intersection.
         self.intersection_mask_draft = intersection_mask_draft.to(device)
         self.intersection_size = int(intersection_mask_draft.sum().item())
+        # Pre-allocated fallback scalars for CUDA-graph-safe token mapping
+        # (avoids .any()/.item() CPU sync inside map_*_ids methods).
+        self._target_unk_tensor = torch.tensor(
+            self.target_unk_token_id, dtype=torch.long, device=device
+        )
+        self._draft_unk_tensor = torch.tensor(
+            self.draft_unk_token_id, dtype=torch.long, device=device
+        )
         # Sorted draft token IDs in the intersection: shape [intersection_size].
         # Used for LM head pruning (see TLIWorker._try_prune_draft_lm_head).
         self.intersection_draft_ids = intersection_mask_draft.nonzero(as_tuple=True)[
@@ -200,10 +208,8 @@ class VocabMapping:
             Integer tensor of draft token IDs with the same shape and dtype.
         """
         draft_ids = self.target_to_draft_ids[target_ids]
-        not_in_intersection = draft_ids == -1
-        if not_in_intersection.any():
-            draft_ids = draft_ids.clone()
-            draft_ids[not_in_intersection] = self.draft_unk_token_id
+        # torch.where is CUDA-graph compatible; avoids .any()/.item() CPU sync.
+        draft_ids = torch.where(draft_ids >= 0, draft_ids, self._draft_unk_tensor)
         return draft_ids.to(target_ids.dtype)
 
     def map_draft_to_target_ids(self, draft_ids: torch.Tensor) -> torch.Tensor:
@@ -218,10 +224,8 @@ class VocabMapping:
             Integer tensor of target token IDs with the same shape and dtype.
         """
         target_ids = self.draft_to_target_ids[draft_ids]
-        not_in_intersection = target_ids == -1
-        if not_in_intersection.any():
-            target_ids = target_ids.clone()
-            target_ids[not_in_intersection] = self.target_unk_token_id
+        # torch.where is CUDA-graph compatible; avoids .any()/.item() CPU sync.
+        target_ids = torch.where(target_ids >= 0, target_ids, self._target_unk_tensor)
         return target_ids.to(draft_ids.dtype)
 
     def constrain_draft_logits(self, logits: torch.Tensor) -> torch.Tensor:
@@ -233,6 +237,6 @@ class VocabMapping:
         Returns:
             A cloned tensor with non-intersection logits set to ``-inf``.
         """
-        logits = logits.clone()
-        logits[..., ~self.intersection_mask_draft] = float("-inf")
-        return logits
+        # masked_fill is CUDA-graph compatible; avoids boolean indexed
+        # assignment which may invoke non-capturable CUDA ops.
+        return logits.masked_fill(~self.intersection_mask_draft, float("-inf"))

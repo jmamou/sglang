@@ -202,12 +202,6 @@ class TLIWorker(StandaloneWorker):
 
         # ── Now capture CUDA graphs with the pruned LM head ──────────────────
         self._defer_cuda_graphs = False
-        # Disable the EAGLE multi-step draft CUDA graph capture:
-        # Device2DraftCudaGraphRunner / EAGLEDraftExtendCudaGraphRunner trigger
-        # cudaErrorStreamCaptureInvalidated on H100 with certain attention
-        # backends.  super().init_cuda_graphs() will return early when
-        # disable_cuda_graph=True, skipping the broken capture entirely.
-        self.server_args.disable_cuda_graph = True
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
