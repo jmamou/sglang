@@ -163,6 +163,7 @@ class EAGLEWorker(TpModelWorker):
             ctx = draft_tp_context(get_attention_tp_group())
         else:
             ctx = empty_context()
+        self._init_eagle3_arch_override = self.speculative_algorithm.is_eagle3()
         with (
             ctx
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -811,6 +812,25 @@ class EAGLEWorker(TpModelWorker):
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
+
+    def _init_model_config(self):
+        """Override to remap EAGLE3 draft model architectures.
+
+        EAGLE3 checkpoints declare ``architectures: ['LlamaForCausalLM']`` in their
+        config.json, but the base ``LlamaForCausalLM.load_weights()`` crashes when
+        the checkpoint stores a reduced hot-token ``embed_tokens`` (e.g. 32000 vs
+        target's 128256).  ``LlamaForCausalLMEagle3`` overrides ``load_weights()``
+        to skip ``embed_tokens`` — safe because it is always replaced from the
+        target via ``set_embed()`` immediately after loading.
+        """
+        super()._init_model_config()
+        if self._init_eagle3_arch_override:
+            archs = getattr(self.model_config.hf_config, "architectures", [])
+            if "LlamaForCausalLM" in archs:
+                self.model_config.hf_config.architectures = [
+                    arch.replace("LlamaForCausalLM", "LlamaForCausalLMEagle3")
+                    for arch in archs
+                ]
 
     def _compute_dsl_min_steps(self) -> int:
         """Minimum loop iteration index at which DSL early exit is safe.

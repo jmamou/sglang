@@ -3499,7 +3499,10 @@ class ServerArgs:
                 or self.decode_attention_backend == "trtllm_mha"
                 or self.prefill_attention_backend == "trtllm_mha"
             ):
-                if self.speculative_eagle_topk > 1:
+                if (
+                    self.speculative_eagle_topk is not None
+                    and self.speculative_eagle_topk > 1
+                ):
                     raise ValueError(
                         "trtllm_mha backend only supports topk = 1 for speculative decoding."
                     )
@@ -3514,7 +3517,8 @@ class ServerArgs:
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
             if (
-                self.speculative_eagle_topk > 1
+                self.speculative_eagle_topk is not None
+                and self.speculative_eagle_topk > 1
                 and self.page_size > 1
                 and self.attention_backend not in ["flashinfer", "fa3"]
             ):
