@@ -173,6 +173,14 @@ class LlamaModel(nn.Module):
             positions = forward_batch.mrope_positions
 
         hidden_states = forward_batch.spec_info.hidden_states
+        # Cast to the draft model's compute dtype (e.g. float16 for EAGLE3).
+        # We cannot use embeds.dtype because set_embed() may have injected the
+        # target model's embed_tokens weight (e.g. bfloat16), making embeds
+        # bfloat16 while all draft model weights remain float16.
+        # Use norm.weight.dtype as the authoritative draft dtype instead.
+        draft_dtype = self.norm.weight.dtype
+        hidden_states = hidden_states.to(draft_dtype)
+        embeds = embeds.to(draft_dtype)
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
 
