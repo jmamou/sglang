@@ -37,7 +37,13 @@ class StandaloneWorker(EAGLEWorker):
     ):
         # Parse arguments
         self.server_args = server_args
-        self.topk = server_args.speculative_eagle_topk
+        # STANDALONE is linear (1 draft token per step), so topk is effectively 1.
+        # speculative_eagle_topk is not required for STANDALONE, default to 1.
+        self.topk = (
+            server_args.speculative_eagle_topk
+            if server_args.speculative_eagle_topk is not None
+            else 1
+        )
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.gpu_id = gpu_id

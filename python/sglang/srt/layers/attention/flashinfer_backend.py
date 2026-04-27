@@ -1494,6 +1494,14 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask=use_custom_mask,
             non_blocking=True,
             fixed_split_size=fixed_split_size,
+            # Disable FA2 split-kv when the wrapper is in CUDA graph mode with spec
+            # decoding (TARGET_VERIFY). The split strategy must be consistent between
+            # CUDA graph capture (kv_seq ~ 1) and replay (kv_seq ~ 1000+).  A mismatch
+            # between "no-split" at capture and "split" at replay causes workspace OOB
+            # and a device-side assert in IndexKernel.
+            disable_split_kv=(
+                wrapper_paged.is_cuda_graph_enabled and spec_info is not None
+            ),
             prefix_len_ptr=prefix_len_ptr,
             token_pos_in_items_ptr=token_pos_in_items_ptr,
             token_pos_in_items_len=token_pos_in_items_len,

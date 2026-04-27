@@ -851,7 +851,7 @@ class EAGLEWorker(TpModelWorker):
         """
         if self.speculative_num_steps <= 1:
             return self.speculative_num_steps
-        if self.topk <= 1:
+        if self.topk is None or self.topk <= 1:
             # Linear drafting (topk=1, e.g. StandaloneWorker): safe to exit
             # from step 1 onward — each completed step produced 1 draft token.
             return 1
