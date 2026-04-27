@@ -54,6 +54,18 @@ class StandaloneWorker(EAGLEWorker):
             server_args.speculative_algorithm
         )
 
+        # EAGLE3 arch override is not applicable to STANDALONE.
+        self._init_eagle3_arch_override = False
+
+        # Dynamic Speculative Length (DSL): confidence-based early exit.
+        # StandaloneWorker bypasses EAGLEWorker.__init__, so we must initialize
+        # the DSL attributes here to avoid AttributeError in draft_forward.
+        self.draft_confidence_threshold = (
+            server_args.speculative_draft_confidence_threshold
+        )
+        self._dsl_min_steps = self._compute_dsl_min_steps()
+        self._last_actual_steps: int = server_args.speculative_num_steps
+
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
