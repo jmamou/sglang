@@ -63,6 +63,16 @@ class TestStandaloneVocabCheck(CustomTestCase):
         # vocab sizes happen to match here, so we hit the mapping check
         self.assertIn("TLI", str(ctx.exception))
 
+    def test_tokenizer_without_get_vocab_skips_mapping_check(self):
+        """Tokenizer types that lack get_vocab() (e.g. TiktokenTokenizer) must not raise."""
+        no_get_vocab = MagicMock(spec=[])  # spec=[] means no attributes at all
+        _validate(
+            len(_VOCAB), len(_VOCAB), no_get_vocab, _tok(_VOCAB_DIFFERENT_MAPPING)
+        )
+        _validate(
+            len(_VOCAB), len(_VOCAB), _tok(_VOCAB_DIFFERENT_MAPPING), no_get_vocab
+        )
+
     def test_none_target_tokenizer_skips_mapping_check(self):
         """If target tokenizer is None, mapping check is skipped even if draft differs."""
         _validate(len(_VOCAB), len(_VOCAB), None, _tok(_VOCAB_DIFFERENT_MAPPING))

@@ -135,8 +135,13 @@ class StandaloneWorker(EAGLEWorker):
         2. The full token-to-id mapping from ``get_vocab()`` must be identical
            (catches same-size but different-content tokenizers).
 
-        Either tokenizer being ``None`` (e.g. ``--skip-tokenizer-init``) skips
-        the deep mapping check.
+        Either tokenizer being ``None`` (e.g. ``--skip-tokenizer-init``) or a
+        tokenizer type that does not implement ``get_vocab()`` (e.g.
+        ``TiktokenTokenizer``) skips the deep mapping check.
+
+        The ``get_vocab()`` comparison is O(vocab_size) but runs only once at
+        startup; on a 256 k-token vocabulary it takes ~300 ms, which is
+        negligible relative to model-loading time.
         """
         if target_vocab_size != draft_vocab_size:
             raise ValueError(
@@ -150,6 +155,8 @@ class StandaloneWorker(EAGLEWorker):
         if (
             target_tokenizer is not None
             and draft_tokenizer is not None
+            and hasattr(target_tokenizer, "get_vocab")
+            and hasattr(draft_tokenizer, "get_vocab")
             and target_tokenizer.get_vocab() != draft_tokenizer.get_vocab()
         ):
             raise ValueError(
