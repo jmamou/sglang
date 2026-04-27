@@ -914,10 +914,13 @@ class EAGLEWorker(TpModelWorker):
             # pass, saving the most expensive GPU work.
             # Guard: only exit when we already have enough candidates to fill
             # speculative_num_draft_tokens (precomputed as _dsl_min_steps).
+            # NOTE: .item() is a GPU->CPU sync that is not allowed during CUDA
+            # graph capture.  Skip the DSL check during capture.
             if (
                 dsl_enabled
                 and i > 0
                 and i >= self._dsl_min_steps
+                and not torch.cuda.is_current_stream_capturing()
                 and topk_p[:, 0].mean().item() < self.draft_confidence_threshold
             ):
                 break
