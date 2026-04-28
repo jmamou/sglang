@@ -90,7 +90,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             if speculative_num_steps is None
             else speculative_num_steps
         )
-        self.topk = model_runner.server_args.speculative_eagle_topk
+        # STANDALONE algorithm does not set speculative_eagle_topk; default to 1.
+        topk = model_runner.server_args.speculative_eagle_topk
+        self.topk = topk if topk is not None else 1
         self.draft_extend_attn_backend = (
             draft_extend_attn_backend or eagle_worker.draft_extend_attn_backend
         )

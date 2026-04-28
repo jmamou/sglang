@@ -85,7 +85,10 @@ class EAGLEDraftCudaGraphRunner:
             if speculative_num_steps is None
             else speculative_num_steps
         )
-        self.topk = model_runner.server_args.speculative_eagle_topk
+        # STANDALONE algorithm does not use speculative_eagle_topk; default to 1
+        # (linear draft: 1 token per step).
+        topk = model_runner.server_args.speculative_eagle_topk
+        self.topk = topk if topk is not None else 1
         self.draft_attn_backend = draft_attn_backend or model_runner.draft_attn_backend
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
