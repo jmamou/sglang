@@ -130,7 +130,11 @@ class EAGLEDraftCudaGraphRunner:
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
-            topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
+            # Initialize topk_p to 1.0 so the DSL confidence threshold check
+            # never fires during CUDA graph warm-up / capture passes.
+            # (zeros would trigger early-exit at step 1 for STANDALONE/topk=1,
+            # leaving too few candidates for organize_draft_results.)
+            topk_p = torch.ones((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             hidden_states = torch.zeros(
                 (self.max_bs, self.model_runner.model_config.spec_hidden_size),
