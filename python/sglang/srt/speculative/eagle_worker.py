@@ -852,9 +852,12 @@ class EAGLEWorker(TpModelWorker):
         if self.speculative_num_steps <= 1:
             return self.speculative_num_steps
         if self.topk is None or self.topk <= 1:
-            # Linear drafting (topk=1, e.g. StandaloneWorker): safe to exit
-            # from step 1 onward — each completed step produced 1 draft token.
-            return 1
+            # Linear drafting (topk=1, e.g. StandaloneWorker): each step
+            # produces exactly 1 candidate in score_list. organize_draft_results
+            # calls torch.topk(score_list, num_draft_token - 1), so we need at
+            # least (num_draft_tokens - 1) entries, i.e. exit only after
+            # completing (num_draft_tokens - 1) steps.
+            return self.speculative_num_draft_tokens - 1
 
         candidates = 0
         for i in range(1, self.speculative_num_steps):
