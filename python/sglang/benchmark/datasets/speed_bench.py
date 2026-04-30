@@ -47,8 +47,8 @@ class SpeedBenchDataset(BaseDataset):
     def load(
         self, tokenizer: PreTrainedTokenizerBase, model_id=None
     ) -> List[DatasetRow]:
-        rows = []
-        with open(self.dataset_path) as f:
+        unique_prompts = []
+        with open(self.dataset_path, encoding="utf-8") as f:
             for line in f:
                 row = json.loads(line)
                 if self.category and row.get("category") != self.category:
@@ -57,24 +57,17 @@ class SpeedBenchDataset(BaseDataset):
                 turns = row.get("turns", [])
                 if not turns:
                     continue
-                prompt_text = turns[0]
-                rows.append(prompt_text)
+                unique_prompts.append(turns[0])
 
-        if not rows:
+        if not unique_prompts:
             raise ValueError(
                 f"No rows found in {self.dataset_path}"
                 + (f" for category={self.category}" if self.category else "")
             )
 
-        # Sample (with replacement if needed)
-        if self.num_requests < len(rows):
-            rows = random.sample(rows, self.num_requests)
-        elif self.num_requests > len(rows):
-            rows = rows * (self.num_requests // len(rows) + 1)
-            rows = rows[: self.num_requests]
-
-        dataset_rows: List[DatasetRow] = []
-        for prompt_text in rows:
+        # Tokenize unique prompts once to avoid redundant work
+        unique_dataset_rows: List[DatasetRow] = []
+        for prompt_text in unique_prompts:
             # Apply chat template to match vllm bench behaviour
             try:
                 prompt_ids = tokenizer.apply_chat_template(
@@ -87,12 +80,23 @@ class SpeedBenchDataset(BaseDataset):
                 prompt_ids = tokenizer.encode(prompt_text)
                 prompt = prompt_text
 
-            dataset_rows.append(
+            unique_dataset_rows.append(
                 DatasetRow(
                     prompt=prompt,
                     prompt_len=len(prompt_ids),
                     output_len=self.output_len,
                 )
             )
+
+        # Sample (with replacement if needed); shuffle oversampled rows for
+        # a realistic request distribution
+        if self.num_requests <= len(unique_dataset_rows):
+            dataset_rows = random.sample(unique_dataset_rows, self.num_requests)
+        else:
+            dataset_rows = unique_dataset_rows * (
+                self.num_requests // len(unique_dataset_rows) + 1
+            )
+            dataset_rows = dataset_rows[: self.num_requests]
+            random.shuffle(dataset_rows)
 
         return dataset_rows
