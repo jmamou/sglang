@@ -269,6 +269,13 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             if "t2d" in name:
                 continue
 
+            # embed_tokens is always replaced from the target model via set_embed()
+            # or set_embed_and_head() in EAGLEWorker.__init__.  Skip it here to
+            # avoid a vocab-size mismatch assertion when the EAGLE3 checkpoint
+            # stores a reduced hot-token embedding (e.g. 32000 < 128256).
+            if "embed_tokens" in name:
+                continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
