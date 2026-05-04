@@ -120,6 +120,16 @@ class EAGLEWorker(TpModelWorker):
                 self, config_path=server_args.speculative_adaptive_config
             )
 
+        # Dynamic Speculative Length (DSL): confidence-based early exit
+        self.draft_confidence_threshold = (
+            server_args.speculative_draft_confidence_threshold
+        )
+        # Minimum loop iteration at which early exit is safe (enough candidates
+        # already collected to fill speculative_num_draft_tokens).
+        self._dsl_min_steps = self._compute_dsl_min_steps()
+        # Actual steps used in the last draft_forward call (set before return).
+        self._last_actual_steps: int = server_args.speculative_num_steps
+
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
@@ -745,6 +755,7 @@ class EAGLEWorker(TpModelWorker):
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
             )
+            actual_steps = self.speculative_num_steps
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if (
@@ -757,6 +768,7 @@ class EAGLEWorker(TpModelWorker):
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
+            actual_steps = self._last_actual_steps
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -780,7 +792,7 @@ class EAGLEWorker(TpModelWorker):
             batch.seq_lens,
             batch.seq_lens_sum,
             self.topk,
-            self.speculative_num_steps,
+            actual_steps,
             self.speculative_num_draft_tokens,
         )
 
@@ -792,13 +804,51 @@ class EAGLEWorker(TpModelWorker):
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_cum_len=None,
-            spec_steps=self.speculative_num_steps,
+            spec_steps=actual_steps,
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
+
+    def _compute_dsl_min_steps(self) -> int:
+        """Minimum loop iteration index at which DSL early exit is safe.
+
+        For tree drafting (topk > 1, EAGLE/EAGLE3):
+          At the start of iteration i, the loop has collected i steps worth of
+          draft tokens in score_list/token_list. The total candidates from
+          those i steps is: topk (step 0) + topk^2 * (i-1) (steps 1..i-1).
+          Returns the smallest i such that total_candidates(i) >=
+          speculative_num_draft_tokens - 1.
+
+        For linear drafting (topk == 1, StandaloneWorker):
+          Each step produces exactly 1 draft token, so any i >= 1 is safe.
+          Returns 1.
+
+        Returns speculative_num_steps if no early exit is possible (single
+        step or no savings), effectively disabling DSL.
+        """
+        if self.speculative_num_steps <= 1:
+            return self.speculative_num_steps
+        if self.topk <= 1:
+            # Linear drafting (topk=1, e.g. StandaloneWorker): safe to exit
+            # from step 1 onward — each completed step produced 1 draft token.
+            return 1
+
+        candidates = 0
+        for i in range(1, self.speculative_num_steps):
+            # candidates from i completed steps
+            if i == 1:
+                candidates = self.topk
+            else:
+                candidates += self.topk**2
+            if candidates >= self.speculative_num_draft_tokens - 1:
+                # After i completed steps we have enough candidates.
+                # Early exit is safe when draft_forward is at iteration i
+                # (score_list already has i entries from steps 0..i-1).
+                return i
+        return self.speculative_num_steps
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -828,9 +878,30 @@ class EAGLEWorker(TpModelWorker):
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
 
+        # Dynamic Speculative Length (DSL): confidence-based early exit.
+        # When draft_confidence_threshold > 0, we skip draft model forward
+        # passes once the mean top-1 probability falls below the threshold,
+        # saving compute without changing the downstream verification pipeline.
+        dsl_enabled = (
+            self.draft_confidence_threshold > 0 and self.speculative_num_steps > 1
+        )
+
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
+            # DSL: check mean top-1 confidence before this iteration's tokens
+            # are generated.  We skip both select_top_k_tokens and the forward
+            # pass, saving the most expensive GPU work.
+            # Guard: only exit when we already have enough candidates to fill
+            # speculative_num_draft_tokens (precomputed as _dsl_min_steps).
+            if (
+                dsl_enabled
+                and i > 0
+                and i >= self._dsl_min_steps
+                and topk_p[:, 0].mean().item() < self.draft_confidence_threshold
+            ):
+                break
+
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
@@ -873,6 +944,9 @@ class EAGLEWorker(TpModelWorker):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+
+        # Record actual steps for use in build_tree_kernel_efficient / EagleVerifyInput.
+        self._last_actual_steps = len(score_list)
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens

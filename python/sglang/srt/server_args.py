@@ -533,6 +533,7 @@ class ServerArgs:
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
+    speculative_draft_confidence_threshold: float = 0.0
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -5519,6 +5520,18 @@ class ServerArgs:
             default=ServerArgs.speculative_skip_dp_mlp_sync,
             help="Skip the extra MLP sync that the scheduler performs before merging a new batch "
             "when speculative decoding + DP attention are both enabled.",
+        )
+        parser.add_argument(
+            "--speculative-draft-confidence-threshold",
+            type=float,
+            help=(
+                "Dynamic Speculative Length (DSL) confidence threshold for early exit. "
+                "When enabled (> 0), stops generating additional speculative tokens if the "
+                "draft model's mean top-1 confidence falls below this threshold, saving "
+                "draft model forward passes. Typical values: 0.2-0.6. "
+                "Only supported for EAGLE/EAGLE3 with topk >= 2. Default: 0.0 (disabled)."
+            ),
+            default=ServerArgs.speculative_draft_confidence_threshold,
         )
 
         # Multi-layer Eagle speculative decoding
