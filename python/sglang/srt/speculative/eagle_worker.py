@@ -121,12 +121,12 @@ class EAGLEWorker(TpModelWorker):
             )
 
         # Dynamic Speculative Length (DSL): confidence-based early exit
-        self.draft_confidence_threshold = (
+        self.draft_confidence_threshold: float = (
             server_args.speculative_draft_confidence_threshold
         )
         # Minimum loop iteration at which early exit is safe (enough candidates
         # already collected to fill speculative_num_draft_tokens).
-        self._dsl_min_steps = self._compute_dsl_min_steps()
+        self._dsl_safe_exit_step: int = self._compute_dsl_safe_exit_step()
         # Actual steps used in the last draft_forward call (set before return).
         self._last_actual_steps: int = server_args.speculative_num_steps
 
@@ -832,8 +832,8 @@ class EAGLEWorker(TpModelWorker):
                     for arch in archs
                 ]
 
-    def _compute_dsl_min_steps(self) -> int:
-        """Minimum loop iteration index at which DSL early exit is safe.
+    def _compute_dsl_safe_exit_step(self) -> int:
+        """Compute minimum loop iteration at which DSL early exit is safe.
 
         For tree drafting (topk > 1, EAGLE/EAGLE3):
           At the start of iteration i, the loop has collected i steps worth of
@@ -843,11 +843,15 @@ class EAGLEWorker(TpModelWorker):
           speculative_num_draft_tokens - 1.
 
         For linear drafting (topk == 1, StandaloneWorker):
-          Each step produces exactly 1 draft token, so any i >= 1 is safe.
-          Returns 1.
+          Each step produces exactly 1 draft token. organize_draft_results
+          (see organize_draft_results in eagle_utils.py) calls
+          torch.topk(score_list, num_draft_token - 1), so we need at least
+          (num_draft_tokens - 1) entries in score_list, i.e. exit only after
+          completing (num_draft_tokens - 1) steps.
 
-        Returns speculative_num_steps if no early exit is possible (single
-        step or no savings), effectively disabling DSL.
+        Returns:
+            int: Minimum safe iteration index for early exit, or
+                 speculative_num_steps if no early exit is possible.
         """
         if self.speculative_num_steps <= 1:
             return self.speculative_num_steps
@@ -916,13 +920,14 @@ class EAGLEWorker(TpModelWorker):
             # are generated.  We skip both select_top_k_tokens and the forward
             # pass, saving the most expensive GPU work.
             # Guard: only exit when we already have enough candidates to fill
-            # speculative_num_draft_tokens (precomputed as _dsl_min_steps).
+            # speculative_num_draft_tokens (precomputed as _dsl_safe_exit_step).
+            # Skip i=0 since topk_p hasn't been computed yet (scores is None initially).
             # NOTE: .item() is a GPU->CPU sync that is not allowed during CUDA
             # graph capture.  Skip the DSL check during capture.
             if (
                 dsl_enabled
                 and i > 0
-                and i >= self._dsl_min_steps
+                and i >= self._dsl_safe_exit_step
                 and not torch.cuda.is_current_stream_capturing()
                 and topk_p[:, 0].mean().item() < self.draft_confidence_threshold
             ):

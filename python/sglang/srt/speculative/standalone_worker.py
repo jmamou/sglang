@@ -60,10 +60,10 @@ class StandaloneWorker(EAGLEWorker):
         # Dynamic Speculative Length (DSL): confidence-based early exit.
         # StandaloneWorker bypasses EAGLEWorker.__init__, so we must initialize
         # the DSL attributes here to avoid AttributeError in draft_forward.
-        self.draft_confidence_threshold = (
+        self.draft_confidence_threshold: float = (
             server_args.speculative_draft_confidence_threshold
         )
-        self._dsl_min_steps = self._compute_dsl_min_steps()
+        self._dsl_safe_exit_step: int = self._compute_dsl_safe_exit_step()
         self._last_actual_steps: int = server_args.speculative_num_steps
 
         # Override the context length of the draft model to be the same as the target model.
