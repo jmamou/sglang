@@ -3526,6 +3526,28 @@ class ServerArgs:
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
                 )
 
+            # Validate Dynamic Speculative Length (DSL) configuration
+            if self.speculative_draft_confidence_threshold < 0.0:
+                raise ValueError(
+                    f"speculative_draft_confidence_threshold must be >= 0.0, got {self.speculative_draft_confidence_threshold}"
+                )
+            if self.speculative_draft_confidence_threshold > 1.0:
+                raise ValueError(
+                    f"speculative_draft_confidence_threshold must be <= 1.0 (probability), got {self.speculative_draft_confidence_threshold}"
+                )
+            if (
+                self.speculative_draft_confidence_threshold > 0
+                and self.speculative_eagle_topk is not None
+                and self.speculative_eagle_topk < 2
+            ):
+                logger.warning(
+                    "DSL (speculative_draft_confidence_threshold=%.2f > 0) has limited effect with topk=%d. "
+                    "DSL primarily benefits tree drafting (topk >= 2) by skipping draft model forward passes. "
+                    "With linear drafting (topk=1), early exit saves fewer operations.",
+                    self.speculative_draft_confidence_threshold,
+                    self.speculative_eagle_topk,
+                )
+
         if self.speculative_algorithm == "NGRAM":
             if not self.device.startswith("cuda"):
                 raise ValueError(
